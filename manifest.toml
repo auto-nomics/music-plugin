@@ -1,0 +1,111 @@
+schema_version = 1
+plugin_name = "music"
+
+[image]
+reference = "ghcr.io/auto-nomics/autonomics/music-deconvolution@sha256:886b83135179a48fffe2009238eb7d45ec89d32713cc1a2370078583e3bbfeaf"
+tag = "1.0.0"
+upstream = "xuranw MuSiC 1.0.0 @ f21fe67f5670d5e9fca0ad7550abaae3423eb59c"
+license = "GPL-3.0-or-later"
+
+# Baked-runner family (the deseq2 pattern): the pinned image carries
+# /opt/autonomics/music_runner.R, so the command is interpreter + fixed argv
+# with no script, and every parameter travels through the nine legacy
+# AUTONOMICS_MUSIC_* environment variables. The image needs no rebuild.
+#
+# The legacy Rust validate() rules the v0 DSL cannot express are enforced (or
+# accepted as lost guards) as follows:
+# - cell_type_col / subject_col non-empty: the runner's required_env() stops
+#   with the legacy "missing required environment variable" message when a
+#   submitted value renders empty.
+# - cell_type_col / subject_col simple-R-identifier shape: not expressible
+#   (no pattern constraint in the v0 param DSL) and not present in the pinned
+#   runner either. Fail-open at container start: any non-empty name is a
+#   legal R list index, and an absent column still stops the runner with the
+#   legacy "cell metadata is missing columns" message.
+# - select_cell_types duplicates / empty entries: not expressible; the
+#   runner's split_csv() drops empty entries, but duplicates flow through to
+#   MuSiC. Documented lost guard (see README).
+# - iter_max > 0, nu > 0, epsilon > 0: enforced here with min/exclusive_min.
+
+[[nodes]]
+kind = "music_deconvolution"
+desc = "Runs pinned MuSiC reference-based bulk RNA-seq deconvolution in an isolated container."
+doc = """
+Reference-based bulk RNA-seq deconvolution with the official R MuSiC package
+(music_prop); the NNLS and weighted least-squares numerics are never
+reimplemented. Required inputs are three tab-separated Files: a gene-by-
+bulk-sample expression matrix whose first column is gene_id, a gene-by-cell
+single-cell count matrix (integer counts, first column gene_id), and a cell
+metadata table whose first column is cell_id holding the submitted
+cell-type and subject columns. The node builds a SingleCellExperiment, runs
+MuSiC::music_prop with the configured columns, and publishes MuSiC
+proportions, NNLS proportions, gene weights, per-sample diagnostics
+(R-squared and proportion variances), and a provenance run report with
+input/output checksums. Cell sizes and marker genes are accepted by the
+official tool but are not wired on this node (see README: optional input
+ports are a v0 manifest DSL gap). No reference dataset is embedded in the
+image.
+"""
+timeout_secs = 7200
+artifact_prefix = "/artifacts/music_deconvolution"
+
+[nodes.ports]
+# The legacy wrapper additionally declared two OPTIONAL unlabeled input
+# ports (cell_type/cell_size table, marker gene table). The v0 PortLayout
+# has no optional-port flag — compile_ports marks every declared input
+# required — so declaring them would force wiring on every run. They are
+# dropped from the declared surface; the pinned runner still honours
+# AUTONOMICS_INPUT3/INPUT4 if a future DSL re-adds optional ports.
+inputs = [
+  { type = "file", label = "bulk_expression" },
+  { type = "file", label = "single_cell_expression" },
+  { type = "file", label = "cell_metadata" },
+]
+outputs = [
+  { path = "cell_type_proportions.tsv", format = "music_proportions_tsv" },
+  { path = "nnls_proportions.tsv", format = "music_nnls_proportions_tsv" },
+  { path = "gene_weights.tsv", format = "music_gene_weights_tsv" },
+  { path = "diagnostics.tsv", format = "music_diagnostics_tsv" },
+  { path = "run_report.json", format = "music_run_report_json" },
+]
+
+[nodes.params]
+cell_type_col = { type = "string", default = "cell_type", doc = "Cell-type column name in the metadata table; must exist and be non-empty (simple R identifier per the legacy contract)" }
+subject_col = { type = "string", default = "subject_id", doc = "Subject/donor column name in the metadata table; each selected cell type must appear in at least two subjects" }
+# DSL gap (deseq2 covariates pattern): the legacy spec carried a string
+# array joined with "," into AUTONOMICS_MUSIC_SELECT_CELL_TYPES, but the v0
+# env renderer space-joins arrays while the baked runner splits this
+# variable on commas (split_csv). A comma-separated string is byte-identical
+# env to the legacy join(",") for every legacy-legal input; empty means all
+# observed cell types are selected.
+select_cell_types = { type = "string", default = "", doc = "Comma-separated cell types to deconvolve (e.g. neuron,astrocyte); must all exist in the metadata, at least two, no duplicates; empty means every observed cell type" }
+iter_max = { type = "int", default = 1000, min = 1.0, doc = "Maximum iterations for the weighted least-squares pass (MuSiC iter.max)" }
+nu = { type = "number", default = 0.0001, exclusive_min = 0.0, doc = "Stopping threshold for the NNLS solver (MuSiC nu); must be finite and greater than zero" }
+epsilon = { type = "number", default = 0.01, exclusive_min = 0.0, doc = "RSq threshold for the variable-selection loop (MuSiC eps); must be finite and greater than zero" }
+centered = { type = "bool", default = false, doc = "Center the gene expression profiles before fitting (MuSiC centered)" }
+normalize = { type = "bool", default = false, doc = "Normalize the gene expression profiles before fitting (MuSiC normalize)" }
+ct_cov = { type = "bool", default = false, doc = "Include cell-type proportions as covariates in the gene-weight regression (MuSiC ct.cov)" }
+
+[nodes.command]
+interpreter = "Rscript"
+argv = ["--vanilla", "/opt/autonomics/music_runner.R"]
+
+[nodes.command.env]
+AUTONOMICS_MUSIC_CELL_TYPE_COL = "{{ cell_type_col }}"
+AUTONOMICS_MUSIC_SUBJECT_COL = "{{ subject_col }}"
+AUTONOMICS_MUSIC_SELECT_CELL_TYPES = "{{ select_cell_types }}"
+AUTONOMICS_MUSIC_ITER_MAX = "{{ iter_max }}"
+AUTONOMICS_MUSIC_NU = "{{ nu }}"
+AUTONOMICS_MUSIC_EPSILON = "{{ epsilon }}"
+AUTONOMICS_MUSIC_CENTERED = "{{ centered }}"
+AUTONOMICS_MUSIC_NORMALIZE = "{{ normalize }}"
+AUTONOMICS_MUSIC_CT_COV = "{{ ct_cov }}"
+
+# Legacy DEFAULT_CPUS/MEMORY/PIDS_LIMIT/SHM_SIZE constants. network/
+# read_only_rootfs/pull_policy keep the hardened defaults (isolated, true,
+# missing), which match the legacy wrapper exactly.
+[nodes.resources]
+cpus = 4.0
+memory = "12Gi"
+pids_limit = 256
+shm_size = "1Gi"
